@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -23,8 +24,9 @@ from dotenv import load_dotenv
 
 API_BASE = "https://api.apify.com/v2"
 
-# Input: {"urls": [<post url>]}
-POST_ACTOR = "supreme_coder~linkedin-post"
+# Input: {"post_urls": [<post url>]}. Output is nested: post / author / stats.
+# (Replaces supreme_coder~linkedin-post, which returns [] for every URL.)
+POST_ACTOR = "apimaestro~linkedin-post-detail"
 
 # Input: {"postIds": [<post url or id>], "limit": <=100, "sortOrder": ...}
 COMMENTS_ACTOR = "apimaestro~linkedin-post-comments-replies-engagements-scraper-no-cookies"
@@ -109,9 +111,42 @@ def _format_error(err: Any) -> str:
 
 # ---- Input validation ----------------------------------------------------
 
+SHORT_LINK_HOSTS = {"lnkd.in", "www.lnkd.in"}
+_LINKEDIN_POST_RE = re.compile(
+    r"https://(?:www\.)?linkedin\.com/(?:posts|feed/update|pulse)/[^\"'<>\s]+"
+)
+
+
+def resolve_short_link(url: str) -> str:
+    """Follow an lnkd.in short link to the full linkedin.com URL, without its query string."""
+    try:
+        r = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            allow_redirects=True,
+            timeout=30,
+        )
+    except requests.RequestException as e:
+        raise ScrapeError(f"Could not resolve short link {url}: {e}")
+    final = r.url
+    if (urlparse(final).hostname or "").lower() in SHORT_LINK_HOSTS:
+        # lnkd.in sometimes serves an interstitial page instead of redirecting.
+        m = _LINKEDIN_POST_RE.search(r.text)
+        if not m:
+            raise ScrapeError(f"Short link {url} did not lead to a LinkedIn post.")
+        final = m.group(0)
+    parsed = urlparse(final)
+    resolved = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    print(f"Resolved {url} -> {resolved}", file=sys.stderr)
+    return resolved
+
 
 def validate_post_url(url: str) -> str:
     url = url.strip()
+    if not urlparse(url).scheme and url.startswith(("lnkd.in/", "linkedin.com/", "www.linkedin.com/")):
+        url = "https://" + url
+    if (urlparse(url).hostname or "").lower() in SHORT_LINK_HOSTS:
+        url = resolve_short_link(url)
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
     if parsed.scheme not in ("http", "https") or not (
@@ -170,7 +205,7 @@ def indent(text: str, prefix: str) -> str:
 
 def cmd_post(url: str, json_path: str | None, as_json: bool) -> None:
     token = get_token()
-    items = run_actor(POST_ACTOR, {"urls": [url]}, token)
+    items = run_actor(POST_ACTOR, {"post_urls": [url]}, token)
     posts = [it for it in items if isinstance(it, dict)]
     if not posts:
         raise ScrapeError(
@@ -182,21 +217,23 @@ def cmd_post(url: str, json_path: str | None, as_json: bool) -> None:
         return
 
     p = posts[0]
-    text = first(p, "text", "commentary", "content")
-    author = first(p, "authorName", "author.name", "authorFullName")
+    text = first(p, "post.text")
+    author = first(p, "author.name")
     if not text and not author:
-        raise ScrapeError("The actor returned a record with no post text or author (post may be unavailable).")
+        # The actor returns a nulled shell for private, removed or login-walled posts.
+        raise ScrapeError("The post could not be retrieved (it may be private, deleted, or login-walled).")
 
+    stats = p.get("stats") or {}
     print(f"Author:    {author or 'unknown'}")
-    headline = first(p, "authorHeadline", "author.headline", "authorTitle")
+    headline = first(p, "author.headline")
     if headline:
         print(f"Headline:  {headline}")
-    print(f"Date:      {fmt_date(first(p, 'postedAtISO', 'postedAt', 'postedAtTimestamp', 'date'))}")
-    print(f"Reactions: {first(p, 'numLikes', 'numReactions', 'stats.total_reactions') or 0}")
-    print(f"Comments:  {first(p, 'numComments', 'stats.comments') or 0}")
-    shares = first(p, "numShares", "stats.shares")
-    if shares is not None:
-        print(f"Shares:    {shares}")
+    print(f"Date:      {fmt_date(first(p, 'post.created_at'))}")
+    print(f"Reactions: {stats.get('total_reactions') or 0}")
+    print(f"Comments:  {stats.get('comments') or 0}")
+    print(f"Shares:    {stats.get('shares') or 0}")
+    if p.get("is_reshared"):
+        print("Note:      this is a reshare; text above is the resharer's commentary.")
     print("-" * 60)
     print(text or "(no text)")
 
